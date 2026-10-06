@@ -1,1037 +1,503 @@
 """
 Business OS — Auto installer
-Round 2a: Services + Schemas + API
+Round 2b: Intelligence asos (costing, profit, leakage)
 """
 import os
 import subprocess
 
 FILES = {}
 
-# ==================== SERVICES ====================
+FILES["backend/app/intelligence/__init__.py"] = ""
 
-FILES["backend/app/services/__init__.py"] = ""
-
-FILES["backend/app/services/inventory.py"] = '''from sqlalchemy.orm import Session
-from sqlalchemy.dialects.postgresql import insert as pg_insert
-
-from app.models.product import Inventory
-
-
-def get_or_create_inventory(db: Session, tenant_id: int,
-                            branch_id: int, product_id: int,
-                            lock: bool = False) -> Inventory:
-    q = db.query(Inventory).filter(
-        Inventory.tenant_id == tenant_id,
-        Inventory.branch_id == branch_id,
-        Inventory.product_id == product_id,
-    )
-    if lock:
-        q = q.with_for_update()
-    inv = q.first()
-    if inv:
-        return inv
-
-    stmt = (
-        pg_insert(Inventory)
-        .values(tenant_id=tenant_id, branch_id=branch_id,
-                product_id=product_id, quantity=0)
-        .on_conflict_do_nothing(
-            index_elements=["tenant_id", "branch_id", "product_id"]
-        )
-    )
-    db.execute(stmt)
-    db.flush()
-
-    q2 = db.query(Inventory).filter(
-        Inventory.tenant_id == tenant_id,
-        Inventory.branch_id == branch_id,
-        Inventory.product_id == product_id,
-    )
-    if lock:
-        q2 = q2.with_for_update()
-    return q2.one()
-'''
-
-FILES["backend/app/services/sales.py"] = '''from collections import defaultdict
-from sqlalchemy.orm import Session
-from fastapi import HTTPException
-
-from app.models.sale import Sale, SaleItem
-from app.models.product import Product, InventoryMovement
-from app.models.customer import Customer
-from app.models.audit import AuditLog
-from app.core.validators import ensure_branch, ensure_customer
-from app.core.tx import transaction
-from app.services.inventory import get_or_create_inventory
-
-
-def _aggregate_items(items):
-    acc = defaultdict(lambda: {"quantity": 0.0, "price": None})
-    for it in items:
-        pid = it["product_id"]
-        acc[pid]["quantity"] += float(it["quantity"])
-        if it.get("price") is not None:
-            acc[pid]["price"] = float(it["price"])
-    return [{"product_id": pid, "quantity": v["quantity"],
-             "price": v["price"]} for pid, v in acc.items()]
-
-
-def create_sale(db: Session, tenant_id: int, branch_id: int,
-                customer_id, items, discount: float, payment_type: str,
-                user_id=None, ip=None) -> Sale:
-    if not items:
-        raise HTTPException(400, "Sotuv bosh bolishi mumkin emas")
-    if discount < 0:
-        raise HTTPException(400, "Skidka manfiy")
-    if payment_type not in ("CASH", "CARD", "CREDIT"):
-        raise HTTPException(400, "Tolov turi notogri")
-
-    ensure_branch(db, tenant_id, branch_id)
-
-    if payment_type == "CREDIT":
-        if not customer_id:
-            raise HTTPException(400, "Qarzga sotuv uchun mijoz shart")
-        ensure_customer(db, tenant_id, customer_id)
-    elif customer_id:
-        ensure_customer(db, tenant_id, customer_id)
-
-    items = _aggregate_items(items)
-    for it in items:
-        if it["quantity"] <= 0:
-            raise HTTPException(400, "Miqdor 0 dan katta bolishi kerak")
-
-    pid_set = {it["product_id"] for it in items}
-    found = db.query(Product).filter(
-        Product.tenant_id == tenant_id, Product.id.in_(pid_set)
-    ).all()
-    if len(found) != len(pid_set):
-        raise HTTPException(404, "Bazi mahsulotlar topilmadi")
-    for p in found:
-        if not p.active:
-            raise HTTPException(400, f"Mahsulot arxivlangan: {p.name}")
-
-    with transaction(db):
-        products_locked = {}
-        for pid in sorted(pid_set):
-            p = db.query(Product).filter(
-                Product.id == pid, Product.tenant_id == tenant_id
-            ).with_for_update().first()
-            products_locked[pid] = p
-
-        subtotal = 0.0
-        prepared = []
-        for it in items:
-            pid = it["product_id"]
-            qty = it["quantity"]
-            product = products_locked[pid]
-            price = float(it["price"] if it["price"] is not None
-                          else product.sale_price)
-            if price < 0:
-                raise HTTPException(400, "Narx manfiy")
-            inv = get_or_create_inventory(db, tenant_id, branch_id, pid,
-                                          lock=True)
-            if inv.quantity < qty:
-                raise HTTPException(400,
-                    f"Omborda yetarli emas: {product.name}")
-            subtotal += price * qty
-            prepared.append((product, inv, qty, price))
-
-        if discount > subtotal:
-            raise HTTPException(400, "Skidka jamidan katta")
-
-        sale = Sale(
-            tenant_id=tenant_id, branch_id=branch_id,
-            customer_id=customer_id,
-            total=round(subtotal - discount, 2),
-            discount=discount, payment_type=payment_type,
-        )
-        db.add(sale)
-        db.flush()
-
-        for product, inv, qty, price in prepared:
-            db.add(SaleItem(
-                tenant_id=tenant_id, sale_id=sale.id,
-                product_id=product.id, quantity=qty,
-                price=price, cost=product.cost_price or 0,
-            ))
-            inv.quantity -= qty
-            db.add(InventoryMovement(
-                tenant_id=tenant_id, branch_id=branch_id,
-                product_id=product.id, delta=-qty,
-                reason="SALE", ref_id=sale.id, user_id=user_id,
-            ))
-
-        if payment_type == "CREDIT" and customer_id:
-            c = db.query(Customer).filter(
-                Customer.id == customer_id,
-                Customer.tenant_id == tenant_id,
-            ).first()
-            c.debt = (c.debt or 0) + sale.total
-
-        db.add(AuditLog(
-            tenant_id=tenant_id, user_id=user_id, action="CREATE",
-            entity="Sale", entity_id=sale.id,
-            payload={"total": sale.total, "items": len(prepared)},
-            ip=ip,
-        ))
-
-    db.refresh(sale)
-    return sale
-'''
-
-FILES["backend/app/services/purchase.py"] = '''from collections import defaultdict
-from datetime import datetime, timedelta
+FILES["backend/app/intelligence/costing.py"] = '''from enum import Enum
+from datetime import datetime
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from fastapi import HTTPException
 
-from app.models.supplier import Supplier, Purchase, PurchaseItem
-from app.models.product import Product, InventoryMovement
+from app.models.product import Product, Inventory
+from app.models.sale import Sale, SaleItem
 from app.models.purchase_history import PurchasePriceHistory
-from app.models.audit import AuditLog
-from app.core.validators import ensure_branch, ensure_supplier
-from app.core.tx import transaction
-from app.services.inventory import get_or_create_inventory
 
 
-def weighted_avg_cost(db: Session, product_id: int, days: int = 90) -> float:
-    since = datetime.utcnow() - timedelta(days=days)
-    row = db.query(
-        func.coalesce(func.sum(PurchasePriceHistory.total), 0),
-        func.coalesce(func.sum(PurchasePriceHistory.quantity), 0),
-    ).filter(
+class CostingMethod(str, Enum):
+    SNAPSHOT = "SNAPSHOT"
+    MOVING_AVERAGE = "MOVING_AVERAGE"
+    FIFO = "FIFO"
+    LIFO = "LIFO"
+
+
+def _purchase_layers(db, tenant_id, product_id, since=None, until=None):
+    q = db.query(PurchasePriceHistory).filter(
+        PurchasePriceHistory.tenant_id == tenant_id,
         PurchasePriceHistory.product_id == product_id,
-        PurchasePriceHistory.created_at >= since,
-    ).first()
-    total_val, total_qty = float(row[0] or 0), float(row[1] or 0)
-    if total_qty == 0:
-        p = db.query(Product).filter(Product.id == product_id).first()
-        return (p.cost_price or 0) if p else 0
+    )
+    if since is not None:
+        q = q.filter(PurchasePriceHistory.created_at >= since)
+    if until is not None:
+        q = q.filter(PurchasePriceHistory.created_at <= until)
+    return [
+        {"qty": float(l.quantity or 0),
+         "price": float(l.unit_price or 0),
+         "t": l.created_at}
+        for l in q.order_by(PurchasePriceHistory.created_at.asc(),
+                            PurchasePriceHistory.id.asc()).all()
+    ]
+
+
+def _sold_rows(db, tenant_id, product_id, since=None, until=None,
+               branch_id=None):
+    q = (db.query(SaleItem, Sale)
+         .join(Sale, Sale.id == SaleItem.sale_id)
+         .filter(SaleItem.tenant_id == tenant_id,
+                 SaleItem.product_id == product_id))
+    if since is not None:
+        q = q.filter(Sale.created_at >= since)
+    if until is not None:
+        q = q.filter(Sale.created_at <= until)
+    if branch_id is not None:
+        q = q.filter(Sale.branch_id == branch_id)
+    return q.order_by(Sale.created_at.asc(), SaleItem.id.asc()).all()
+
+
+def _total_sold_qty(db, tenant_id, product_id, since=None, until=None,
+                    branch_id=None):
+    q = (db.query(func.coalesce(func.sum(SaleItem.quantity), 0))
+         .join(Sale, Sale.id == SaleItem.sale_id)
+         .filter(SaleItem.tenant_id == tenant_id,
+                 SaleItem.product_id == product_id))
+    if since is not None:
+        q = q.filter(Sale.created_at >= since)
+    if until is not None:
+        q = q.filter(Sale.created_at <= until)
+    if branch_id is not None:
+        q = q.filter(Sale.branch_id == branch_id)
+    return float(q.scalar() or 0)
+
+
+def _fallback_cost(db, product_id):
+    p = db.query(Product).filter(Product.id == product_id).first()
+    return float(p.cost_price or 0) if p else 0.0
+
+
+def moving_average_cost(db, tenant_id, product_id, as_of=None):
+    layers = _purchase_layers(db, tenant_id, product_id, until=as_of)
+    total_qty = sum(l["qty"] for l in layers)
+    if total_qty <= 0:
+        return _fallback_cost(db, product_id)
+    total_val = sum(l["qty"] * l["price"] for l in layers)
     return total_val / total_qty
 
 
-def _aggregate(items):
-    acc = defaultdict(float)
-    for it in items:
-        key = (it["product_id"], float(it["price"]))
-        acc[key] += float(it["quantity"])
-    return [{"product_id": pid, "price": price, "quantity": qty}
-            for (pid, price), qty in acc.items()]
-
-
-def create_purchase(db: Session, tenant_id: int, branch_id: int,
-                    supplier_id, items, paid: float,
-                    user_id=None, ip=None) -> Purchase:
-    if not items:
-        raise HTTPException(400, "Xarid bosh")
-    if paid < 0:
-        raise HTTPException(400, "Tolangan summa manfiy")
-
-    ensure_branch(db, tenant_id, branch_id)
-    if supplier_id:
-        ensure_supplier(db, tenant_id, supplier_id)
-
-    items = _aggregate(items)
-    pid_set = {it["product_id"] for it in items}
-    found = db.query(Product).filter(
-        Product.tenant_id == tenant_id, Product.id.in_(pid_set)
-    ).all()
-    if len(found) != len(pid_set):
-        raise HTTPException(404, "Bazi mahsulotlar topilmadi")
-
-    total = 0.0
-    for it in items:
-        if it["quantity"] <= 0 or it["price"] < 0:
-            raise HTTPException(400, "Miqdor > 0, narx >= 0")
-        total += it["quantity"] * it["price"]
-
-    if paid > total:
-        raise HTTPException(400, "Tolov jamidan katta")
-
-    with transaction(db):
-        purchase = Purchase(
-            tenant_id=tenant_id, branch_id=branch_id,
-            supplier_id=supplier_id, total=total, paid=paid,
-        )
-        db.add(purchase)
-        db.flush()
-
-        for it in items:
-            db.add(PurchaseItem(
-                tenant_id=tenant_id, purchase_id=purchase.id,
-                product_id=it["product_id"],
-                quantity=it["quantity"], price=it["price"],
-            ))
-            db.add(PurchasePriceHistory(
-                tenant_id=tenant_id, product_id=it["product_id"],
-                supplier_id=supplier_id, purchase_id=purchase.id,
-                quantity=it["quantity"], unit_price=it["price"],
-                total=it["quantity"] * it["price"],
-            ))
-            inv = get_or_create_inventory(db, tenant_id, branch_id,
-                                          it["product_id"], lock=True)
-            inv.quantity += it["quantity"]
-            db.add(InventoryMovement(
-                tenant_id=tenant_id, branch_id=branch_id,
-                product_id=it["product_id"], delta=it["quantity"],
-                reason="PURCHASE", ref_id=purchase.id, user_id=user_id,
-            ))
-
-        for it in items:
-            db.flush()
-            p = db.query(Product).filter(
-                Product.id == it["product_id"]).first()
-            p.cost_price = weighted_avg_cost(db, p.id)
-
-        debt = total - paid
-        if debt > 0 and supplier_id:
-            s = db.query(Supplier).filter(Supplier.id == supplier_id).first()
-            s.debt = (s.debt or 0) + debt
-
-        db.add(AuditLog(
-            tenant_id=tenant_id, user_id=user_id, action="CREATE",
-            entity="Purchase", entity_id=purchase.id,
-            payload={"total": total, "paid": paid, "items": len(items)},
-            ip=ip,
-        ))
-
-    db.refresh(purchase)
-    return purchase
-'''
-
-# ==================== SCHEMAS ====================
-
-FILES["backend/app/schemas/__init__.py"] = ""
-
-FILES["backend/app/schemas/auth.py"] = '''from pydantic import BaseModel, EmailStr
-
-
-class RegisterIn(BaseModel):
-    business_type: str
-    company_name: str
-    branches_count: int = 1
-    employees_count: int = 1
-    currency: str = "TJS"
-    country: str = "TJ"
-    owner_email: EmailStr
-    owner_name: str
-    password: str
-
-
-class LoginIn(BaseModel):
-    email: EmailStr
-    password: str
-
-
-class TokenOut(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-'''
-
-# ==================== API ====================
-
-FILES["backend/app/api/__init__.py"] = ""
-
-FILES["backend/app/api/auth.py"] = '''from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
-
-from app.core.database import get_db
-from app.core.security import hash_password, verify_password, create_token
-from app.models.tenant import Tenant
-from app.models.user import User
-from app.models.company import Company, Branch
-from app.schemas.auth import RegisterIn, LoginIn, TokenOut
-
-router = APIRouter(prefix="/api/auth", tags=["auth"])
-
-
-@router.post("/register", response_model=TokenOut)
-def register(data: RegisterIn, db: Session = Depends(get_db)):
-    if db.query(User).filter(User.email == data.owner_email).first():
-        raise HTTPException(400, "Bu email allaqachon royxatdan otgan")
-
-    tenant = Tenant(name=data.company_name, industry=data.business_type,
-                    country=data.country, currency=data.currency)
-    db.add(tenant)
-    db.flush()
-
-    company = Company(tenant_id=tenant.id, name=data.company_name,
-                      currency=data.currency, country=data.country)
-    db.add(company)
-    db.flush()
-
-    for i in range(max(1, data.branches_count)):
-        db.add(Branch(tenant_id=tenant.id, company_id=company.id,
-                      name=f"Filial {i+1}", kind="BRANCH"))
-
-    user = User(tenant_id=tenant.id, email=data.owner_email,
-                full_name=data.owner_name, role="OWNER",
-                password_hash=hash_password(data.password))
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-
-    token = create_token({"sub": str(user.id), "tenant": tenant.id,
-                          "role": user.role})
-    return {"access_token": token}
-
-
-@router.post("/login", response_model=TokenOut)
-def login(data: LoginIn, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.email == data.email).first()
-    if not user or not verify_password(data.password, user.password_hash):
-        raise HTTPException(401, "Email yoki parol xato")
-    token = create_token({"sub": str(user.id), "tenant": user.tenant_id,
-                          "role": user.role})
-    return {"access_token": token}
-'''
-
-FILES["backend/app/api/tenants.py"] = '''from fastapi import APIRouter, Depends
-from sqlalchemy.orm import Session
-
-from app.core.database import get_db
-from app.core.deps import current_user
-from app.models.user import User
-from app.models.tenant import Tenant
-
-router = APIRouter(prefix="/api/tenants", tags=["tenants"])
-
-
-INDUSTRIES_TJ = [
-    {"code": "retail", "label": "Dukon / Retail"},
-    {"code": "restaurant", "label": "Restoran / Kafe"},
-    {"code": "pharmacy", "label": "Apteka"},
-    {"code": "fashion", "label": "Kiyim-kechak"},
-    {"code": "auto", "label": "Avtoservis"},
-    {"code": "construction", "label": "Qurilish"},
-    {"code": "wholesale", "label": "Distribyutor"},
-    {"code": "beauty", "label": "Salon / Beauty"},
-    {"code": "manufacturing", "label": "Ishlab chiqarish"},
-    {"code": "other", "label": "Boshqa"},
-]
-
-
-@router.get("/industries")
-def industries():
-    return INDUSTRIES_TJ
-
-
-@router.get("/me")
-def me(user: User = Depends(current_user), db: Session = Depends(get_db)):
-    tenant = db.query(Tenant).filter(Tenant.id == user.tenant_id).first()
-    return {
-        "tenant": {
-            "id": tenant.id, "name": tenant.name,
-            "industry": tenant.industry,
-            "currency": tenant.currency, "country": tenant.country,
-        },
-        "user": {"id": user.id, "name": user.full_name, "role": user.role},
-    }
-'''
-
-FILES["backend/app/api/products.py"] = '''from fastapi import APIRouter, Depends
-from sqlalchemy.orm import Session
-from pydantic import BaseModel, Field
-
-from app.core.database import get_db
-from app.core.deps import require
-from app.core.tx import transaction
-from app.core.validators import ensure_product
-from app.models.user import User
-from app.models.product import Product
-from app.models.audit import AuditLog
-
-router = APIRouter(prefix="/api/products", tags=["products"])
-
-
-class ProductIn(BaseModel):
-    sku: str | None = None
-    name: str = Field(min_length=1)
-    category: str | None = None
-    cost_price: float = Field(default=0, ge=0)
-    sale_price: float = Field(default=0, ge=0)
-
-
-@router.get("")
-def list_products(q: str | None = None, include_inactive: bool = False,
-                  user: User = Depends(require("products", "view")),
-                  db: Session = Depends(get_db)):
-    query = db.query(Product).filter(Product.tenant_id == user.tenant_id)
-    if not include_inactive:
-        query = query.filter(Product.active.is_(True))
-    if q:
-        query = query.filter(Product.name.ilike(f"%{q}%"))
-    return [{"id": p.id, "sku": p.sku, "name": p.name, "category": p.category,
-             "cost_price": p.cost_price, "sale_price": p.sale_price,
-             "active": p.active}
-            for p in query.order_by(Product.name).limit(200).all()]
-
-
-@router.post("")
-def create(data: ProductIn,
-           user: User = Depends(require("products", "create")),
-           db: Session = Depends(get_db)):
-    with transaction(db):
-        p = Product(tenant_id=user.tenant_id, **data.model_dump())
-        db.add(p)
-        db.flush()
-        db.add(AuditLog(tenant_id=user.tenant_id, user_id=user.id,
-                        action="CREATE", entity="Product", entity_id=p.id))
-    return {"id": p.id, "name": p.name}
-
-
-@router.put("/{pid}")
-def update(pid: int, data: ProductIn,
-           user: User = Depends(require("products", "edit")),
-           db: Session = Depends(get_db)):
-    with transaction(db):
-        p = ensure_product(db, user.tenant_id, pid)
-        for k, v in data.model_dump().items():
-            setattr(p, k, v)
-    return {"ok": True}
-
-
-@router.delete("/{pid}")
-def delete(pid: int,
-           user: User = Depends(require("products", "delete")),
-           db: Session = Depends(get_db)):
-    with transaction(db):
-        p = ensure_product(db, user.tenant_id, pid)
-        p.active = False
-    return {"ok": True, "active": False}
-
-
-@router.post("/{pid}/restore")
-def restore(pid: int,
-            user: User = Depends(require("products", "edit")),
-            db: Session = Depends(get_db)):
-    with transaction(db):
-        p = ensure_product(db, user.tenant_id, pid)
-        p.active = True
-    return {"ok": True, "active": True}
-'''
-
-FILES["backend/app/api/sales.py"] = '''from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy.orm import Session
-from pydantic import BaseModel, Field
-
-from app.core.database import get_db
-from app.core.deps import require
-from app.models.user import User
-from app.models.sale import Sale, SaleItem
-from app.services.sales import create_sale
-
-router = APIRouter(prefix="/api/sales", tags=["sales"])
-
-
-class SaleItemIn(BaseModel):
-    product_id: int
-    quantity: float = Field(gt=0)
-    price: float | None = Field(default=None, ge=0)
-
-
-class SaleIn(BaseModel):
-    branch_id: int
-    customer_id: int | None = None
-    items: list[SaleItemIn] = Field(min_length=1)
-    discount: float = Field(default=0, ge=0)
-    payment_type: str = Field(default="CASH", pattern="^(CASH|CARD|CREDIT)$")
-
-
-@router.post("")
-def create(data: SaleIn, request: Request,
-           user: User = Depends(require("sales", "create")),
-           db: Session = Depends(get_db)):
-    sale = create_sale(
-        db, user.tenant_id, data.branch_id, data.customer_id,
-        [i.model_dump() for i in data.items],
-        data.discount, data.payment_type, user.id,
-        ip=request.client.host if request.client else None,
-    )
-    return {"id": sale.id, "total": sale.total}
-
-
-@router.get("")
-def list_sales(limit: int = 50, branch_id: int | None = None,
-               user: User = Depends(require("sales", "view")),
-               db: Session = Depends(get_db)):
-    q = db.query(Sale).filter(Sale.tenant_id == user.tenant_id)
-    if branch_id:
-        q = q.filter(Sale.branch_id == branch_id)
-    rows = q.order_by(Sale.created_at.desc()).limit(limit).all()
-    return [{"id": s.id, "total": s.total, "discount": s.discount,
-             "payment_type": s.payment_type, "branch_id": s.branch_id,
-             "customer_id": s.customer_id,
-             "created_at": s.created_at} for s in rows]
-
-
-@router.get("/{sale_id}")
-def detail(sale_id: int,
-           user: User = Depends(require("sales", "view")),
-           db: Session = Depends(get_db)):
-    s = db.query(Sale).filter(Sale.id == sale_id,
-                              Sale.tenant_id == user.tenant_id).first()
-    if not s:
-        raise HTTPException(404, "Sotuv topilmadi")
-    items = db.query(SaleItem).filter(SaleItem.sale_id == s.id).all()
-    return {"id": s.id, "total": s.total, "discount": s.discount,
-            "payment_type": s.payment_type, "created_at": s.created_at,
-            "items": [{"product_id": i.product_id, "quantity": i.quantity,
-                       "price": i.price, "cost": i.cost} for i in items]}
-'''
-
-FILES["backend/app/api/inventory.py"] = '''from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
-from pydantic import BaseModel, Field
-
-from app.core.database import get_db
-from app.core.deps import require
-from app.core.tx import transaction
-from app.core.validators import ensure_branch, ensure_product
-from app.models.user import User
-from app.models.product import Product, Inventory, InventoryMovement
-from app.models.inventory_count import InventoryCount
-from app.models.audit import AuditLog
-
-router = APIRouter(prefix="/api/inventory", tags=["inventory"])
-
-
-class AdjustIn(BaseModel):
-    branch_id: int
-    product_id: int
-    delta: float
-    reason: str = Field(default="ADJUST", pattern="^(ADJUST|RETURN|OTHER)$")
-
-
-class CountIn(BaseModel):
-    branch_id: int
-    product_id: int
-    actual_qty: float = Field(ge=0)
-    note: str | None = None
-
-
-@router.get("")
-def stock(branch_id: int | None = None,
-          user: User = Depends(require("inventory", "view")),
-          db: Session = Depends(get_db)):
-    q = (db.query(Product, Inventory)
-         .join(Inventory, (Inventory.product_id == Product.id)
-                          & (Inventory.tenant_id == Product.tenant_id))
-         .filter(Product.tenant_id == user.tenant_id))
-    if branch_id:
-        ensure_branch(db, user.tenant_id, branch_id)
-        q = q.filter(Inventory.branch_id == branch_id)
-    return [{"product_id": p.id, "sku": p.sku, "name": p.name,
-             "branch_id": inv.branch_id, "quantity": inv.quantity,
-             "cost_price": p.cost_price, "sale_price": p.sale_price}
-            for p, inv in q.all()]
-
-
-@router.post("/adjust")
-def adjust(data: AdjustIn,
-           user: User = Depends(require("inventory", "adjust")),
-           db: Session = Depends(get_db)):
-    if data.delta == 0:
-        raise HTTPException(400, "Delta 0")
-    with transaction(db):
-        ensure_branch(db, user.tenant_id, data.branch_id)
-        ensure_product(db, user.tenant_id, data.product_id)
-        inv = db.query(Inventory).filter(
-            Inventory.tenant_id == user.tenant_id,
-            Inventory.branch_id == data.branch_id,
-            Inventory.product_id == data.product_id,
-        ).with_for_update().first()
-        if not inv:
-            inv = Inventory(tenant_id=user.tenant_id,
-                            branch_id=data.branch_id,
-                            product_id=data.product_id, quantity=0)
-            db.add(inv)
-            db.flush()
-        if inv.quantity + data.delta < 0:
-            raise HTTPException(400, "Zaxira manfiy")
-        inv.quantity += data.delta
-        db.add(InventoryMovement(
-            tenant_id=user.tenant_id, branch_id=data.branch_id,
-            product_id=data.product_id, delta=data.delta,
-            reason=data.reason, user_id=user.id,
-        ))
-    return {"product_id": data.product_id, "new_quantity": inv.quantity}
-
-
-@router.post("/count")
-def physical_count(data: CountIn,
-                   user: User = Depends(require("inventory", "count")),
-                   db: Session = Depends(get_db)):
-    with transaction(db):
-        ensure_branch(db, user.tenant_id, data.branch_id)
-        product = ensure_product(db, user.tenant_id, data.product_id)
-        inv = db.query(Inventory).filter(
-            Inventory.tenant_id == user.tenant_id,
-            Inventory.branch_id == data.branch_id,
-            Inventory.product_id == data.product_id,
-        ).with_for_update().first()
-        expected = inv.quantity if inv else 0
-        variance = expected - data.actual_qty
-        unit_cost = product.cost_price or 0
-        variance_value = variance * unit_cost
-        db.add(InventoryCount(
-            tenant_id=user.tenant_id, branch_id=data.branch_id,
-            product_id=data.product_id, expected_qty=expected,
-            actual_qty=data.actual_qty, variance_qty=variance,
-            unit_cost=unit_cost, variance_value=variance_value,
-            counted_by=user.id, note=data.note,
-        ))
-        if inv:
-            inv.quantity = data.actual_qty
+def unit_cost_at(db, tenant_id, product_id, as_of=None,
+                 method=CostingMethod.MOVING_AVERAGE):
+    if method == CostingMethod.SNAPSHOT:
+        raise ValueError("SNAPSHOT SaleItem.cost dan olinadi.")
+    if method == CostingMethod.MOVING_AVERAGE:
+        return moving_average_cost(db, tenant_id, product_id, as_of=as_of)
+    layers = _purchase_layers(db, tenant_id, product_id, until=as_of)
+    sold = _total_sold_qty(db, tenant_id, product_id, until=as_of)
+    while sold > 0 and layers:
+        idx = 0 if method == CostingMethod.FIFO else -1
+        layer = layers[idx]
+        take = min(sold, layer["qty"])
+        layer["qty"] -= take
+        sold -= take
+        if layer["qty"] <= 0:
+            layers.pop(idx)
+    if not layers:
+        return _fallback_cost(db, product_id)
+    idx = 0 if method == CostingMethod.FIFO else -1
+    return layers[idx]["price"]
+
+
+def cogs_for_period(db, tenant_id, since, until,
+                    method=CostingMethod.SNAPSHOT,
+                    product_id=None, branch_id=None):
+    if method == CostingMethod.SNAPSHOT:
+        q = (db.query(
+                func.coalesce(func.sum(SaleItem.cost * SaleItem.quantity), 0),
+                func.coalesce(func.sum(SaleItem.quantity), 0),
+                func.count(SaleItem.id))
+             .join(Sale, Sale.id == SaleItem.sale_id)
+             .filter(SaleItem.tenant_id == tenant_id,
+                     Sale.created_at >= since,
+                     Sale.created_at <= until))
+        if product_id is not None:
+            q = q.filter(SaleItem.product_id == product_id)
+        if branch_id is not None:
+            q = q.filter(Sale.branch_id == branch_id)
+        cogs, qty, count = q.first()
+        return {"method": method.value,
+                "cogs": round(float(cogs or 0), 2),
+                "quantity_sold": float(qty or 0),
+                "sales_count": int(count or 0)}
+
+    pid_q = (db.query(SaleItem.product_id)
+             .join(Sale, Sale.id == SaleItem.sale_id)
+             .filter(SaleItem.tenant_id == tenant_id,
+                     Sale.created_at >= since,
+                     Sale.created_at <= until))
+    if product_id is not None:
+        pid_q = pid_q.filter(SaleItem.product_id == product_id)
+    if branch_id is not None:
+        pid_q = pid_q.filter(Sale.branch_id == branch_id)
+    product_ids = {r[0] for r in pid_q.distinct().all()}
+
+    total_cogs = 0.0
+    total_qty = 0.0
+    total_sales = 0
+    for pid in product_ids:
+        if method == CostingMethod.MOVING_AVERAGE:
+            p_cogs, p_qty, p_count = _moving_avg_for_product(
+                db, tenant_id, pid, since, until, branch_id)
         else:
-            db.add(Inventory(tenant_id=user.tenant_id,
-                             branch_id=data.branch_id,
-                             product_id=data.product_id,
-                             quantity=data.actual_qty))
-        db.add(InventoryMovement(
-            tenant_id=user.tenant_id, branch_id=data.branch_id,
-            product_id=data.product_id, delta=-variance,
-            reason="COUNT", user_id=user.id,
-        ))
-    return {"expected": expected, "actual": data.actual_qty,
-            "variance_qty": variance,
-            "variance_value": round(variance_value, 2)}
+            p_cogs, p_qty, p_count = _fifo_lifo_for_product(
+                db, tenant_id, pid, since, until, method, branch_id)
+        total_cogs += p_cogs
+        total_qty += p_qty
+        total_sales += p_count
+
+    return {"method": method.value,
+            "cogs": round(total_cogs, 2),
+            "quantity_sold": total_qty,
+            "sales_count": total_sales}
 
 
-@router.get("/movements")
-def movements(limit: int = 100, branch_id: int | None = None,
-              user: User = Depends(require("inventory", "view")),
-              db: Session = Depends(get_db)):
-    q = db.query(InventoryMovement).filter(
-        InventoryMovement.tenant_id == user.tenant_id)
-    if branch_id:
-        q = q.filter(InventoryMovement.branch_id == branch_id)
-    rows = q.order_by(InventoryMovement.created_at.desc()).limit(limit).all()
-    return [{"id": m.id, "branch_id": m.branch_id,
-             "product_id": m.product_id, "delta": m.delta,
-             "reason": m.reason, "user_id": m.user_id,
-             "created_at": m.created_at} for m in rows]
+def _moving_avg_for_product(db, tenant_id, product_id, since, until,
+                            branch_id=None):
+    rows = _sold_rows(db, tenant_id, product_id, since=since, until=until,
+                      branch_id=branch_id)
+    total_cogs = 0.0
+    total_qty = 0.0
+    for si, s in rows:
+        unit = moving_average_cost(db, tenant_id, product_id,
+                                   as_of=s.created_at)
+        total_cogs += float(si.quantity or 0) * unit
+        total_qty += float(si.quantity or 0)
+    return total_cogs, total_qty, len(rows)
+
+
+def _fifo_lifo_for_product(db, tenant_id, product_id, since, until,
+                           method, branch_id=None):
+    layers = _purchase_layers(db, tenant_id, product_id, until=until)
+    rows = _sold_rows(db, tenant_id, product_id, until=until,
+                      branch_id=branch_id)
+    total_cogs = 0.0
+    total_qty = 0.0
+    count = 0
+    for si, s in rows:
+        qty_needed = float(si.quantity or 0)
+        cogs_line = 0.0
+        while qty_needed > 0 and layers:
+            idx = 0 if method == CostingMethod.FIFO else -1
+            layer = layers[idx]
+            take = min(qty_needed, layer["qty"])
+            cogs_line += take * layer["price"]
+            layer["qty"] -= take
+            qty_needed -= take
+            if layer["qty"] <= 0:
+                layers.pop(idx)
+        if qty_needed > 0:
+            cogs_line += qty_needed * _fallback_cost(db, product_id)
+        if s.created_at >= since:
+            total_cogs += cogs_line
+            total_qty += float(si.quantity or 0)
+            count += 1
+    return total_cogs, total_qty, count
+
+
+def stock_valuation(db, tenant_id, product_id=None, branch_id=None,
+                    method=CostingMethod.MOVING_AVERAGE):
+    if method == CostingMethod.SNAPSHOT:
+        raise ValueError("SNAPSHOT qollanilmaydi.")
+    q = db.query(Inventory).filter(Inventory.tenant_id == tenant_id)
+    if product_id is not None:
+        q = q.filter(Inventory.product_id == product_id)
+    if branch_id is not None:
+        q = q.filter(Inventory.branch_id == branch_id)
+    rows = q.all()
+    total_qty = 0.0
+    total_value = 0.0
+    by_product = {}
+    for r in rows:
+        by_product.setdefault(r.product_id, []).append(
+            {"qty": float(r.quantity or 0)})
+        total_qty += float(r.quantity or 0)
+    if method == CostingMethod.MOVING_AVERAGE:
+        for pid, items in by_product.items():
+            unit = moving_average_cost(db, tenant_id, pid)
+            for it in items:
+                total_value += it["qty"] * unit
+    else:
+        for pid, items in by_product.items():
+            qty = sum(it["qty"] for it in items)
+            layers = _purchase_layers(db, tenant_id, pid)
+            sold = _total_sold_qty(db, tenant_id, pid)
+            while sold > 0 and layers:
+                idx = 0 if method == CostingMethod.FIFO else -1
+                layer = layers[idx]
+                take = min(sold, layer["qty"])
+                layer["qty"] -= take
+                sold -= take
+                if layer["qty"] <= 0:
+                    layers.pop(idx)
+            need = qty
+            for layer in layers:
+                if need <= 0:
+                    break
+                take = min(need, layer["qty"])
+                total_value += take * layer["price"]
+                need -= take
+            if need > 0:
+                total_value += need * _fallback_cost(db, pid)
+    return {"method": method.value,
+            "total_qty": round(total_qty, 2),
+            "total_value": round(total_value, 2),
+            "unit_cost_avg": round(total_value / total_qty, 2) if total_qty else 0.0}
+
+
+def products_valuation(db, tenant_id, branch_id=None,
+                       method=CostingMethod.MOVING_AVERAGE):
+    if method == CostingMethod.SNAPSHOT:
+        raise ValueError("SNAPSHOT qollanilmaydi.")
+    q = (db.query(Inventory.product_id,
+                  func.coalesce(func.sum(Inventory.quantity), 0).label("qty"))
+         .filter(Inventory.tenant_id == tenant_id))
+    if branch_id is not None:
+        q = q.filter(Inventory.branch_id == branch_id)
+    rows = q.group_by(Inventory.product_id).all()
+    out = []
+    for pid, qty in rows:
+        qty = float(qty or 0)
+        if qty <= 0:
+            continue
+        p = db.query(Product).filter(Product.id == pid).first()
+        if not p:
+            continue
+        if method == CostingMethod.MOVING_AVERAGE:
+            unit = moving_average_cost(db, tenant_id, pid)
+        else:
+            unit = unit_cost_at(db, tenant_id, pid, method=method)
+        out.append({"product_id": pid, "sku": p.sku, "name": p.name,
+                    "quantity": qty, "unit_cost": round(unit, 2),
+                    "total_value": round(qty * unit, 2),
+                    "method": method.value})
+    out.sort(key=lambda x: x["total_value"], reverse=True)
+    return out
 '''
 
-FILES["backend/app/api/crm.py"] = '''from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
-from pydantic import BaseModel, Field
-
-from app.core.database import get_db
-from app.core.deps import require
-from app.core.tx import transaction
-from app.core.validators import ensure_customer
-from app.models.user import User
-from app.models.customer import Customer
-from app.models.payment import Payment
-from app.models.sale import Sale
-
-router = APIRouter(prefix="/api/customers", tags=["crm"])
-
-
-class CustomerIn(BaseModel):
-    name: str
-    phone: str | None = None
-
-
-class PayIn(BaseModel):
-    amount: float = Field(gt=0)
-    method: str = Field(default="CASH", pattern="^(CASH|CARD|BANK)$")
-
-
-@router.get("")
-def list_c(user: User = Depends(require("customers", "view")),
-           db: Session = Depends(get_db)):
-    rows = (db.query(Customer)
-            .filter(Customer.tenant_id == user.tenant_id)
-            .order_by(Customer.name).limit(500).all())
-    return [{"id": c.id, "name": c.name, "phone": c.phone,
-             "debt": c.debt} for c in rows]
-
-
-@router.post("")
-def create(data: CustomerIn,
-           user: User = Depends(require("customers", "create")),
-           db: Session = Depends(get_db)):
-    with transaction(db):
-        c = Customer(tenant_id=user.tenant_id, **data.model_dump())
-        db.add(c)
-        db.flush()
-    return {"id": c.id}
-
-
-@router.post("/{cid}/pay")
-def pay(cid: int, data: PayIn,
-        user: User = Depends(require("customers", "edit")),
-        db: Session = Depends(get_db)):
-    with transaction(db):
-        c = ensure_customer(db, user.tenant_id, cid)
-        if data.amount > (c.debt or 0):
-            raise HTTPException(400, "Tolov qarzdan katta")
-        c.debt -= data.amount
-        db.add(Payment(tenant_id=user.tenant_id, party_type="CUSTOMER",
-                       party_id=cid, amount=data.amount,
-                       direction="IN", method=data.method))
-    return {"id": c.id, "debt": c.debt}
-'''
-
-FILES["backend/app/api/suppliers.py"] = '''from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy.orm import Session
-from pydantic import BaseModel, Field
-
-from app.core.database import get_db
-from app.core.deps import require
-from app.core.tx import transaction
-from app.core.validators import ensure_supplier
-from app.models.user import User
-from app.models.supplier import Supplier
-from app.models.payment import Payment
-from app.services.purchase import create_purchase
-
-router = APIRouter(prefix="/api/suppliers", tags=["suppliers"])
-
-
-class SupplierIn(BaseModel):
-    name: str
-    phone: str | None = None
-    email: str | None = None
-
-
-class PurchaseItemIn(BaseModel):
-    product_id: int
-    quantity: float = Field(gt=0)
-    price: float = Field(ge=0)
-
-
-class PurchaseIn(BaseModel):
-    branch_id: int
-    supplier_id: int | None = None
-    items: list[PurchaseItemIn] = Field(min_length=1)
-    paid: float = Field(default=0, ge=0)
-
-
-class PayIn(BaseModel):
-    amount: float = Field(gt=0)
-    method: str = Field(default="CASH", pattern="^(CASH|CARD|BANK)$")
-
-
-@router.get("")
-def list_s(user: User = Depends(require("suppliers", "view")),
-           db: Session = Depends(get_db)):
-    rows = db.query(Supplier).filter(Supplier.tenant_id == user.tenant_id).all()
-    return [{"id": s.id, "name": s.name, "phone": s.phone,
-             "debt": s.debt} for s in rows]
-
-
-@router.post("")
-def create(data: SupplierIn,
-           user: User = Depends(require("suppliers", "create")),
-           db: Session = Depends(get_db)):
-    with transaction(db):
-        s = Supplier(tenant_id=user.tenant_id, **data.model_dump())
-        db.add(s)
-        db.flush()
-    return {"id": s.id}
-
-
-@router.post("/purchases")
-def purchase(data: PurchaseIn, request: Request,
-             user: User = Depends(require("purchases", "create")),
-             db: Session = Depends(get_db)):
-    p = create_purchase(
-        db, user.tenant_id, data.branch_id, data.supplier_id,
-        [i.model_dump() for i in data.items], data.paid, user.id,
-        ip=request.client.host if request.client else None,
-    )
-    return {"id": p.id, "total": p.total, "paid": p.paid,
-            "debt": p.total - p.paid}
-
-
-@router.post("/{sid}/pay")
-def pay_supplier(sid: int, data: PayIn,
-                 user: User = Depends(require("suppliers", "edit")),
-                 db: Session = Depends(get_db)):
-    with transaction(db):
-        s = ensure_supplier(db, user.tenant_id, sid)
-        if data.amount > (s.debt or 0):
-            raise HTTPException(400, "Tolov qarzdan katta")
-        s.debt -= data.amount
-        db.add(Payment(tenant_id=user.tenant_id, party_type="SUPPLIER",
-                       party_id=sid, amount=data.amount,
-                       direction="OUT", method=data.method))
-    return {"id": s.id, "debt": s.debt}
-'''
-
-FILES["backend/app/api/finance.py"] = '''from fastapi import APIRouter, Depends
+FILES["backend/app/intelligence/profit.py"] = '''from datetime import datetime
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from pydantic import BaseModel
 
-from app.core.database import get_db
-from app.core.deps import require
-from app.models.user import User
+from app.models.sale import Sale, SaleItem
 from app.models.finance import Expense
-from app.models.sale import Sale
-
-router = APIRouter(prefix="/api/finance", tags=["finance"])
-
-
-class ExpenseIn(BaseModel):
-    branch_id: int | None = None
-    category: str
-    amount: float
-    note: str | None = None
+from app.models.company import Branch
+from app.models.product import Product
+from app.intelligence.costing import cogs_for_period, CostingMethod
 
 
-@router.post("/expenses")
-def add_expense(data: ExpenseIn,
-                user: User = Depends(require("finance", "create")),
-                db: Session = Depends(get_db)):
-    e = Expense(tenant_id=user.tenant_id, **data.model_dump())
-    db.add(e)
-    db.commit()
-    db.refresh(e)
-    return {"id": e.id}
+def real_profit(db, tenant_id, since=None, until=None,
+                branch_id=None, costing=CostingMethod.SNAPSHOT):
+    q_sales = db.query(
+        func.coalesce(func.sum(Sale.total), 0),
+        func.count(Sale.id),
+    ).filter(Sale.tenant_id == tenant_id)
+    if since:
+        q_sales = q_sales.filter(Sale.created_at >= since)
+    if until:
+        q_sales = q_sales.filter(Sale.created_at <= until)
+    if branch_id:
+        q_sales = q_sales.filter(Sale.branch_id == branch_id)
+    revenue, sales_count = q_sales.first()
+    revenue = float(revenue or 0)
+
+    effective_since = since or datetime(1970, 1, 1)
+    effective_until = until or datetime.utcnow()
+    cogs_result = cogs_for_period(
+        db, tenant_id, effective_since, effective_until,
+        method=costing, branch_id=branch_id)
+    cogs = float(cogs_result["cogs"])
+
+    q_exp = db.query(func.coalesce(func.sum(Expense.amount), 0))\\
+        .filter(Expense.tenant_id == tenant_id)
+    if since:
+        q_exp = q_exp.filter(Expense.created_at >= since)
+    if until:
+        q_exp = q_exp.filter(Expense.created_at <= until)
+    if branch_id:
+        q_exp = q_exp.filter(Expense.branch_id == branch_id)
+    expenses = float(q_exp.scalar() or 0)
+
+    gross = revenue - cogs
+    net = gross - expenses
+    return {
+        "costing_method": costing.value,
+        "revenue": round(revenue, 2),
+        "sales_count": int(sales_count or 0),
+        "cogs": round(cogs, 2),
+        "gross_profit": round(gross, 2),
+        "expenses": round(expenses, 2),
+        "net_profit": round(net, 2),
+        "gross_margin_pct": round((gross / revenue * 100) if revenue else 0, 2),
+        "net_margin_pct": round((net / revenue * 100) if revenue else 0, 2),
+    }
 
 
-@router.get("/expenses")
-def list_expenses(user: User = Depends(require("finance", "view")),
-                  db: Session = Depends(get_db)):
-    rows = (db.query(Expense)
-            .filter(Expense.tenant_id == user.tenant_id)
-            .order_by(Expense.created_at.desc()).limit(200).all())
-    return [{"id": e.id, "category": e.category, "amount": e.amount,
-             "note": e.note, "created_at": e.created_at} for e in rows]
+def profit_by_branch(db, tenant_id, since=None, until=None,
+                     costing=CostingMethod.SNAPSHOT):
+    out = []
+    for b in db.query(Branch).filter(Branch.tenant_id == tenant_id).all():
+        p = real_profit(db, tenant_id, since, until,
+                        branch_id=b.id, costing=costing)
+        out.append({"branch_id": b.id, "branch_name": b.name, **p})
+    out.sort(key=lambda x: x["net_profit"], reverse=True)
+    return out
 
 
-@router.get("/summary")
-def summary(user: User = Depends(require("finance", "view")),
-            db: Session = Depends(get_db)):
-    revenue = (db.query(func.coalesce(func.sum(Sale.total), 0))
-               .filter(Sale.tenant_id == user.tenant_id).scalar() or 0)
-    expenses = (db.query(func.coalesce(func.sum(Expense.amount), 0))
-                .filter(Expense.tenant_id == user.tenant_id).scalar() or 0)
-    return {"revenue": float(revenue), "expenses": float(expenses),
-            "net": float(revenue) - float(expenses)}
+def profit_by_product(db, tenant_id, since=None, until=None,
+                      branch_id=None, limit=50):
+    q = (db.query(
+            SaleItem.product_id,
+            func.sum(SaleItem.quantity).label("qty"),
+            func.sum(SaleItem.price * SaleItem.quantity).label("revenue"),
+            func.sum(SaleItem.cost * SaleItem.quantity).label("cogs"))
+         .join(Sale, Sale.id == SaleItem.sale_id)
+         .filter(SaleItem.tenant_id == tenant_id))
+    if since:
+        q = q.filter(Sale.created_at >= since)
+    if until:
+        q = q.filter(Sale.created_at <= until)
+    if branch_id:
+        q = q.filter(Sale.branch_id == branch_id)
+    rows = q.group_by(SaleItem.product_id).all()
+    products = {p.id: p for p in db.query(Product).filter(
+        Product.tenant_id == tenant_id).all()}
+    result = []
+    for pid, qty, rev, cogs in rows:
+        rev = float(rev or 0)
+        cogs = float(cogs or 0)
+        profit = rev - cogs
+        p = products.get(pid)
+        result.append({
+            "product_id": pid,
+            "name": p.name if p else "?",
+            "sku": p.sku if p else None,
+            "quantity": float(qty or 0),
+            "revenue": round(rev, 2),
+            "cogs": round(cogs, 2),
+            "profit": round(profit, 2),
+            "margin_pct": round((profit / rev * 100) if rev else 0, 2),
+        })
+    result.sort(key=lambda x: x["profit"], reverse=True)
+    return result[:limit]
 '''
 
-FILES["backend/app/api/audit.py"] = '''from fastapi import APIRouter, Depends
+FILES["backend/app/intelligence/leakage.py"] = '''from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 
-from app.core.database import get_db
-from app.core.deps import require
-from app.models.user import User
-from app.models.audit import AuditLog
-
-router = APIRouter(prefix="/api/audit", tags=["audit"])
+from app.models.sale import Sale, SaleItem
+from app.models.product import Product
+from app.models.inventory_count import InventoryCount
 
 
-@router.get("")
-def list_logs(limit: int = 100, action: str | None = None,
-              entity: str | None = None,
-              user: User = Depends(require("reports", "view")),
-              db: Session = Depends(get_db)):
-    q = db.query(AuditLog).filter(AuditLog.tenant_id == user.tenant_id)
-    if action:
-        q = q.filter(AuditLog.action == action)
-    if entity:
-        q = q.filter(AuditLog.entity == entity)
-    rows = q.order_by(AuditLog.created_at.desc()).limit(limit).all()
-    return [{"id": a.id, "user_id": a.user_id, "action": a.action,
-             "entity": a.entity, "entity_id": a.entity_id,
-             "payload": a.payload,
-             "created_at": a.created_at} for a in rows]
+def _excess_discount(db, tenant_id):
+    row = db.query(
+        func.coalesce(func.sum(Sale.total), 0),
+        func.coalesce(func.sum(Sale.discount), 0),
+    ).filter(Sale.tenant_id == tenant_id).first()
+    revenue, discount = float(row[0] or 0), float(row[1] or 0)
+    gross = revenue + discount
+    if gross <= 0:
+        return None
+    pct = discount / gross * 100
+    THRESHOLD = 8.0
+    if pct <= THRESHOLD:
+        return None
+    excess = discount - gross * (THRESHOLD / 100)
+    return {"kind": "excess_discount", "amount": round(excess, 2),
+            "message_tj": f"Skidka ulushi {pct:.1f}% - meyordan yuqori. "
+                          f"Ortiqcha: {excess:,.0f} TJS."}
+
+
+def _below_cost(db, tenant_id):
+    rows = (db.query(SaleItem, Product)
+            .join(Product, Product.id == SaleItem.product_id)
+            .filter(SaleItem.tenant_id == tenant_id,
+                    SaleItem.price < Product.cost_price).all())
+    loss = 0.0
+    count = 0
+    for si, p in rows:
+        diff = (p.cost_price or 0) - (si.price or 0)
+        if diff > 0:
+            loss += diff * (si.quantity or 0)
+            count += 1
+    if count == 0:
+        return None
+    return {"kind": "below_cost_sales", "amount": round(loss, 2),
+            "message_tj": f"{count} ta sotuv tan narxdan past. "
+                          f"Real zarar: {loss:,.0f} TJS."}
+
+
+def _inventory_variance(db, tenant_id, days=30):
+    since = datetime.utcnow() - timedelta(days=days)
+    rows = db.query(InventoryCount).filter(
+        InventoryCount.tenant_id == tenant_id,
+        InventoryCount.created_at >= since,
+        InventoryCount.variance_value > 0,
+    ).all()
+    if not rows:
+        return None
+    loss = sum(r.variance_value for r in rows)
+    return {"kind": "inventory_variance", "amount": round(loss, 2),
+            "message_tj": f"{len(rows)} ta inventarizatsiyada "
+                          f"{loss:,.0f} TJS zarar."}
+
+
+def detect_leakage(db, tenant_id):
+    findings = []
+    for fn in (_excess_discount, _below_cost, _inventory_variance):
+        r = fn(db, tenant_id)
+        if r:
+            findings.append(r)
+    total = sum(f["amount"] for f in findings)
+    return {"total_leak": round(total, 2), "findings": findings}
 '''
 
-FILES["backend/app/api/intelligence.py"] = '''from fastapi import APIRouter, Depends
+FILES["backend/app/intelligence/dead_stock.py"] = '''from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 
-from app.core.database import get_db
-from app.core.deps import require
-from app.models.user import User
-
-router = APIRouter(prefix="/api/intelligence", tags=["intelligence"])
+from app.models.product import Product, Inventory
+from app.models.sale import SaleItem, Sale
 
 
-@router.get("/profit")
-def profit(user: User = Depends(require("intelligence", "view")),
-           db: Session = Depends(get_db)):
-    try:
-        from app.intelligence.profit import real_profit
-        return real_profit(db, user.tenant_id)
-    except ImportError:
-        return {"available": False, "reason": "Module not installed yet"}
-
-
-@router.get("/leakage")
-def leakage(user: User = Depends(require("intelligence", "view")),
-            db: Session = Depends(get_db)):
-    try:
-        from app.intelligence.leakage import detect_leakage
-        return detect_leakage(db, user.tenant_id)
-    except ImportError:
-        return {"total_leak": 0, "findings": []}
-
-
-@router.get("/dead-stock")
-def dead(user: User = Depends(require("intelligence", "view")),
-         db: Session = Depends(get_db)):
-    try:
-        from app.intelligence.dead_stock_tiers import summary as dst_summary
-        return dst_summary(db, user.tenant_id)
-    except ImportError:
-        return {"total_capital_locked": 0, "by_tier": {}}
-
-
-@router.get("/forecast")
-def forecast(user: User = Depends(require("intelligence", "view")),
-             db: Session = Depends(get_db)):
-    try:
-        from app.intelligence.forecast import revenue_forecast
-        return revenue_forecast(db, user.tenant_id)
-    except ImportError:
-        return {"available": False, "reason": "Module not installed yet"}
-
-
-@router.get("/recommendations")
-def recs(user: User = Depends(require("intelligence", "view")),
-         db: Session = Depends(get_db)):
-    try:
-        from app.intelligence.optimization import generate as opt_generate
-        return opt_generate(db, user.tenant_id)
-    except ImportError:
-        return {"summary": {"total_actions": 0}, "actions": []}
-'''
-
-FILES["backend/app/api/ai.py"] = '''from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
-from sqlalchemy.orm import Session
-
-from app.core.database import get_db
-from app.core.deps import require
-from app.models.user import User
-
-router = APIRouter(prefix="/api/ai", tags=["ai"])
-
-
-class AskIn(BaseModel):
-    question: str = Field(min_length=1, max_length=500)
-    branch_id: int | None = None
-
-
-@router.post("/copilot")
-def copilot(data: AskIn,
-            user: User = Depends(require("ai", "use")),
-            db: Session = Depends(get_db)):
-    try:
-        from app.ai.copilot import ask
-        resp = ask(db, user.tenant_id, data.question, data.branch_id)
-        return resp.to_dict()
-    except ImportError:
-        return {
-            "answer_tj": "AI Copilot hali ornatilmagan.",
-            "mode": "local", "intent": "empty", "used_sections": [],
-        }
+def dead_stock(db, tenant_id, days=60):
+    since = datetime.utcnow() - timedelta(days=days)
+    sold_rows = (db.query(SaleItem.product_id)
+                 .join(Sale, Sale.id == SaleItem.sale_id)
+                 .filter(SaleItem.tenant_id == tenant_id,
+                         Sale.created_at >= since)
+                 .distinct().all())
+    sold_ids = {r[0] for r in sold_rows}
+    items = []
+    total_locked = 0.0
+    rows = (db.query(Product, func.coalesce(func.sum(Inventory.quantity), 0))
+            .outerjoin(Inventory, Inventory.product_id == Product.id)
+            .filter(Product.tenant_id == tenant_id)
+            .group_by(Product.id).all())
+    for p, qty in rows:
+        if qty <= 0 or p.id in sold_ids:
+            continue
+        locked = qty * (p.cost_price or 0)
+        total_locked += locked
+        items.append({"product_id": p.id, "sku": p.sku, "name": p.name,
+                      "quantity": qty, "locked_capital": round(locked, 2),
+                      "recommendation_tj": f"{days} kundan beri sotilmagan."})
+    items.sort(key=lambda x: x["locked_capital"], reverse=True)
+    return {"capital_locked": round(total_locked, 2),
+            "items": items[:50], "days": days}
 '''
 
 
@@ -1045,11 +511,9 @@ def main():
             f.write(content)
         count += 1
         print(f"OK {path}")
-
-    print(f"\nRound 2a: {count} ta fayl yaratildi")
-
+    print(f"\nRound 2b: {count} ta fayl")
     subprocess.run(["git", "add", "-A"], check=False)
-    subprocess.run(["git", "commit", "-m", "Round 2a: Services + Schemas + API"], check=False)
+    subprocess.run(["git", "commit", "-m", "Round 2b: Intelligence base"], check=False)
     subprocess.run(["git", "push", "origin", "main"], check=False)
     print("GitHub'ga yuborildi")
 
