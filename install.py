@@ -1,503 +1,557 @@
 """
 Business OS — Auto installer
-Round 2b: Intelligence asos (costing, profit, leakage)
+Round 2c: dead_stock_tiers + supplier_anomaly
 """
 import os
 import subprocess
 
 FILES = {}
 
-FILES["backend/app/intelligence/__init__.py"] = ""
-
-FILES["backend/app/intelligence/costing.py"] = '''from enum import Enum
-from datetime import datetime
+FILES["backend/app/intelligence/dead_stock_tiers.py"] = '''from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 
 from app.models.product import Product, Inventory
 from app.models.sale import Sale, SaleItem
-from app.models.purchase_history import PurchasePriceHistory
+from app.intelligence.costing import (
+    products_valuation, _purchase_layers, _total_sold_qty,
+    CostingMethod,
+)
 
 
-class CostingMethod(str, Enum):
-    SNAPSHOT = "SNAPSHOT"
-    MOVING_AVERAGE = "MOVING_AVERAGE"
-    FIFO = "FIFO"
-    LIFO = "LIFO"
+@dataclass
+class TiersConfig:
+    dead_days: int = 90
+    slow_days: int = 45
+    risk_days: int = 21
+    slow_velocity: float = 0.5
+    velocity_window: int = 30
+    trend_drop_pct: float = 40.0
+    min_capital: float = 0.0
+    chunk_size: int = 500
+
+    def to_dict(self):
+        return asdict(self)
 
 
-def _purchase_layers(db, tenant_id, product_id, since=None, until=None):
-    q = db.query(PurchasePriceHistory).filter(
-        PurchasePriceHistory.tenant_id == tenant_id,
-        PurchasePriceHistory.product_id == product_id,
-    )
-    if since is not None:
-        q = q.filter(PurchasePriceHistory.created_at >= since)
-    if until is not None:
-        q = q.filter(PurchasePriceHistory.created_at <= until)
-    return [
-        {"qty": float(l.quantity or 0),
-         "price": float(l.unit_price or 0),
-         "t": l.created_at}
-        for l in q.order_by(PurchasePriceHistory.created_at.asc(),
-                            PurchasePriceHistory.id.asc()).all()
-    ]
+def _chunks(seq, size):
+    seq = list(seq)
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
 
 
-def _sold_rows(db, tenant_id, product_id, since=None, until=None,
-               branch_id=None):
-    q = (db.query(SaleItem, Sale)
-         .join(Sale, Sale.id == SaleItem.sale_id)
-         .filter(SaleItem.tenant_id == tenant_id,
-                 SaleItem.product_id == product_id))
-    if since is not None:
-        q = q.filter(Sale.created_at >= since)
-    if until is not None:
-        q = q.filter(Sale.created_at <= until)
-    if branch_id is not None:
-        q = q.filter(Sale.branch_id == branch_id)
-    return q.order_by(Sale.created_at.asc(), SaleItem.id.asc()).all()
+def _last_sale_map(db, tenant_id, product_ids, branch_id=None):
+    out = {}
+    for chunk in _chunks(product_ids, 500):
+        q = (db.query(SaleItem.product_id, func.max(Sale.created_at))
+             .join(Sale, Sale.id == SaleItem.sale_id)
+             .filter(SaleItem.tenant_id == tenant_id,
+                     SaleItem.product_id.in_(chunk)))
+        if branch_id is not None:
+            q = q.filter(Sale.branch_id == branch_id)
+        for pid, t in q.group_by(SaleItem.product_id).all():
+            if t is not None:
+                out[pid] = t
+    return out
 
 
-def _total_sold_qty(db, tenant_id, product_id, since=None, until=None,
-                    branch_id=None):
-    q = (db.query(func.coalesce(func.sum(SaleItem.quantity), 0))
-         .join(Sale, Sale.id == SaleItem.sale_id)
-         .filter(SaleItem.tenant_id == tenant_id,
-                 SaleItem.product_id == product_id))
-    if since is not None:
-        q = q.filter(Sale.created_at >= since)
-    if until is not None:
-        q = q.filter(Sale.created_at <= until)
-    if branch_id is not None:
-        q = q.filter(Sale.branch_id == branch_id)
-    return float(q.scalar() or 0)
+def _qty_in_window(db, tenant_id, product_ids, start, end, branch_id=None):
+    out = {}
+    for chunk in _chunks(product_ids, 500):
+        q = (db.query(SaleItem.product_id, func.sum(SaleItem.quantity))
+             .join(Sale, Sale.id == SaleItem.sale_id)
+             .filter(SaleItem.tenant_id == tenant_id,
+                     SaleItem.product_id.in_(chunk),
+                     Sale.created_at >= start,
+                     Sale.created_at < end))
+        if branch_id is not None:
+            q = q.filter(Sale.branch_id == branch_id)
+        for pid, qty in q.group_by(SaleItem.product_id).all():
+            out[pid] = float(qty or 0)
+    return out
 
 
-def _fallback_cost(db, product_id):
-    p = db.query(Product).filter(Product.id == product_id).first()
-    return float(p.cost_price or 0) if p else 0.0
-
-
-def moving_average_cost(db, tenant_id, product_id, as_of=None):
-    layers = _purchase_layers(db, tenant_id, product_id, until=as_of)
-    total_qty = sum(l["qty"] for l in layers)
-    if total_qty <= 0:
-        return _fallback_cost(db, product_id)
-    total_val = sum(l["qty"] * l["price"] for l in layers)
-    return total_val / total_qty
-
-
-def unit_cost_at(db, tenant_id, product_id, as_of=None,
-                 method=CostingMethod.MOVING_AVERAGE):
-    if method == CostingMethod.SNAPSHOT:
-        raise ValueError("SNAPSHOT SaleItem.cost dan olinadi.")
-    if method == CostingMethod.MOVING_AVERAGE:
-        return moving_average_cost(db, tenant_id, product_id, as_of=as_of)
-    layers = _purchase_layers(db, tenant_id, product_id, until=as_of)
-    sold = _total_sold_qty(db, tenant_id, product_id, until=as_of)
+def _stock_age_days(db, tenant_id, product_id, as_of=None):
+    now = as_of or datetime.utcnow()
+    layers = _purchase_layers(db, tenant_id, product_id)
+    if not layers:
+        return None
+    sold = _total_sold_qty(db, tenant_id, product_id)
     while sold > 0 and layers:
-        idx = 0 if method == CostingMethod.FIFO else -1
-        layer = layers[idx]
+        layer = layers[0]
         take = min(sold, layer["qty"])
         layer["qty"] -= take
         sold -= take
         if layer["qty"] <= 0:
-            layers.pop(idx)
-    if not layers:
-        return _fallback_cost(db, product_id)
-    idx = 0 if method == CostingMethod.FIFO else -1
-    return layers[idx]["price"]
+            layers.pop(0)
+    remaining = [(l["qty"], l["t"]) for l in layers if l["qty"] > 0]
+    if not remaining:
+        return None
+    total_qty = sum(q for q, _ in remaining)
+    if total_qty <= 0:
+        return None
+    weighted = sum(q * (now - t).days for q, t in remaining) / total_qty
+    return round(weighted, 1)
 
 
-def cogs_for_period(db, tenant_id, since, until,
-                    method=CostingMethod.SNAPSHOT,
-                    product_id=None, branch_id=None):
-    if method == CostingMethod.SNAPSHOT:
-        q = (db.query(
-                func.coalesce(func.sum(SaleItem.cost * SaleItem.quantity), 0),
-                func.coalesce(func.sum(SaleItem.quantity), 0),
-                func.count(SaleItem.id))
-             .join(Sale, Sale.id == SaleItem.sale_id)
-             .filter(SaleItem.tenant_id == tenant_id,
-                     Sale.created_at >= since,
-                     Sale.created_at <= until))
-        if product_id is not None:
-            q = q.filter(SaleItem.product_id == product_id)
-        if branch_id is not None:
-            q = q.filter(Sale.branch_id == branch_id)
-        cogs, qty, count = q.first()
-        return {"method": method.value,
-                "cogs": round(float(cogs or 0), 2),
-                "quantity_sold": float(qty or 0),
-                "sales_count": int(count or 0)}
+def _classify_one(quantity, capital_locked, last_sale_days,
+                  velocity_recent, velocity_prev, stock_age_days, cfg):
+    if last_sale_days is not None and last_sale_days >= cfg.dead_days:
+        return ("DEAD", "DISCOUNT",
+                f"{int(last_sale_days)} kundan beri sotilmagan")
+    if last_sale_days is None and (stock_age_days or 0) >= cfg.dead_days:
+        return ("DEAD", "DISCOUNT",
+                f"Hech qachon sotilmagan, zaxira yoshi {int(stock_age_days or 0)} kun")
 
-    pid_q = (db.query(SaleItem.product_id)
-             .join(Sale, Sale.id == SaleItem.sale_id)
-             .filter(SaleItem.tenant_id == tenant_id,
-                     Sale.created_at >= since,
-                     Sale.created_at <= until))
-    if product_id is not None:
-        pid_q = pid_q.filter(SaleItem.product_id == product_id)
-    if branch_id is not None:
-        pid_q = pid_q.filter(Sale.branch_id == branch_id)
-    product_ids = {r[0] for r in pid_q.distinct().all()}
+    if last_sale_days is not None and last_sale_days >= cfg.risk_days:
+        if last_sale_days < cfg.slow_days and velocity_recent < cfg.slow_velocity * 1.5:
+            return ("AT-RISK", "MONITOR",
+                    f"Oxirgi sotuv {int(last_sale_days)} kun oldin, "
+                    f"sekinlashmoqda ({velocity_recent:.2f} dona/kun)")
 
-    total_cogs = 0.0
-    total_qty = 0.0
-    total_sales = 0
-    for pid in product_ids:
-        if method == CostingMethod.MOVING_AVERAGE:
-            p_cogs, p_qty, p_count = _moving_avg_for_product(
-                db, tenant_id, pid, since, until, branch_id)
-        else:
-            p_cogs, p_qty, p_count = _fifo_lifo_for_product(
-                db, tenant_id, pid, since, until, method, branch_id)
-        total_cogs += p_cogs
-        total_qty += p_qty
-        total_sales += p_count
+    if velocity_recent < cfg.slow_velocity:
+        if last_sale_days is not None and last_sale_days >= cfg.slow_days:
+            return ("SLOW", "PROMOTE",
+                    f"Oxirgi sotuv {int(last_sale_days)} kun oldin, "
+                    f"tezlik {velocity_recent:.2f} dona/kun")
+        if velocity_recent == 0:
+            return ("SLOW", "PROMOTE",
+                    f"Oxirgi {cfg.velocity_window} kunda sotuv yoq")
+        return ("SLOW", "PROMOTE",
+                f"Sotuv tezligi past: {velocity_recent:.2f} dona/kun")
 
-    return {"method": method.value,
-            "cogs": round(total_cogs, 2),
-            "quantity_sold": total_qty,
-            "sales_count": total_sales}
+    if velocity_prev > 0:
+        drop_pct = (velocity_prev - velocity_recent) / velocity_prev * 100
+        if drop_pct >= cfg.trend_drop_pct:
+            return ("AT-RISK", "MONITOR",
+                    f"Talab {drop_pct:.0f}% pasaydi")
+    return ("NORMAL", "RETAIN", "")
 
 
-def _moving_avg_for_product(db, tenant_id, product_id, since, until,
-                            branch_id=None):
-    rows = _sold_rows(db, tenant_id, product_id, since=since, until=until,
-                      branch_id=branch_id)
-    total_cogs = 0.0
-    total_qty = 0.0
-    for si, s in rows:
-        unit = moving_average_cost(db, tenant_id, product_id,
-                                   as_of=s.created_at)
-        total_cogs += float(si.quantity or 0) * unit
-        total_qty += float(si.quantity or 0)
-    return total_cogs, total_qty, len(rows)
+def classify(db, tenant_id, branch_id=None, cfg=None,
+             include_normal=False,
+             costing=CostingMethod.MOVING_AVERAGE):
+    cfg = cfg or TiersConfig()
+    now = datetime.utcnow()
+    valuation = products_valuation(db, tenant_id, branch_id=branch_id,
+                                   method=costing)
+    valuation = {v["product_id"]: v for v in valuation}
+    if not valuation:
+        return _empty_result(cfg)
 
+    product_ids = list(valuation.keys())
+    last_sale_map = _last_sale_map(db, tenant_id, product_ids, branch_id)
+    recent_start = now - timedelta(days=cfg.velocity_window)
+    prev_start = now - timedelta(days=2 * cfg.velocity_window)
+    recent_qty = _qty_in_window(db, tenant_id, product_ids,
+                                recent_start, now, branch_id)
+    prev_qty = _qty_in_window(db, tenant_id, product_ids,
+                              prev_start, recent_start, branch_id)
 
-def _fifo_lifo_for_product(db, tenant_id, product_id, since, until,
-                           method, branch_id=None):
-    layers = _purchase_layers(db, tenant_id, product_id, until=until)
-    rows = _sold_rows(db, tenant_id, product_id, until=until,
-                      branch_id=branch_id)
-    total_cogs = 0.0
-    total_qty = 0.0
-    count = 0
-    for si, s in rows:
-        qty_needed = float(si.quantity or 0)
-        cogs_line = 0.0
-        while qty_needed > 0 and layers:
-            idx = 0 if method == CostingMethod.FIFO else -1
-            layer = layers[idx]
-            take = min(qty_needed, layer["qty"])
-            cogs_line += take * layer["price"]
-            layer["qty"] -= take
-            qty_needed -= take
-            if layer["qty"] <= 0:
-                layers.pop(idx)
-        if qty_needed > 0:
-            cogs_line += qty_needed * _fallback_cost(db, product_id)
-        if s.created_at >= since:
-            total_cogs += cogs_line
-            total_qty += float(si.quantity or 0)
-            count += 1
-    return total_cogs, total_qty, count
+    items = []
+    tier_buckets = {
+        "DEAD": {"count": 0, "capital_locked": 0.0, "quantity": 0.0},
+        "SLOW": {"count": 0, "capital_locked": 0.0, "quantity": 0.0},
+        "AT-RISK": {"count": 0, "capital_locked": 0.0, "quantity": 0.0},
+        "NORMAL": {"count": 0, "capital_locked": 0.0, "quantity": 0.0},
+    }
+    total_locked = 0.0
 
-
-def stock_valuation(db, tenant_id, product_id=None, branch_id=None,
-                    method=CostingMethod.MOVING_AVERAGE):
-    if method == CostingMethod.SNAPSHOT:
-        raise ValueError("SNAPSHOT qollanilmaydi.")
-    q = db.query(Inventory).filter(Inventory.tenant_id == tenant_id)
-    if product_id is not None:
-        q = q.filter(Inventory.product_id == product_id)
-    if branch_id is not None:
-        q = q.filter(Inventory.branch_id == branch_id)
-    rows = q.all()
-    total_qty = 0.0
-    total_value = 0.0
-    by_product = {}
-    for r in rows:
-        by_product.setdefault(r.product_id, []).append(
-            {"qty": float(r.quantity or 0)})
-        total_qty += float(r.quantity or 0)
-    if method == CostingMethod.MOVING_AVERAGE:
-        for pid, items in by_product.items():
-            unit = moving_average_cost(db, tenant_id, pid)
-            for it in items:
-                total_value += it["qty"] * unit
-    else:
-        for pid, items in by_product.items():
-            qty = sum(it["qty"] for it in items)
-            layers = _purchase_layers(db, tenant_id, pid)
-            sold = _total_sold_qty(db, tenant_id, pid)
-            while sold > 0 and layers:
-                idx = 0 if method == CostingMethod.FIFO else -1
-                layer = layers[idx]
-                take = min(sold, layer["qty"])
-                layer["qty"] -= take
-                sold -= take
-                if layer["qty"] <= 0:
-                    layers.pop(idx)
-            need = qty
-            for layer in layers:
-                if need <= 0:
-                    break
-                take = min(need, layer["qty"])
-                total_value += take * layer["price"]
-                need -= take
-            if need > 0:
-                total_value += need * _fallback_cost(db, pid)
-    return {"method": method.value,
-            "total_qty": round(total_qty, 2),
-            "total_value": round(total_value, 2),
-            "unit_cost_avg": round(total_value / total_qty, 2) if total_qty else 0.0}
-
-
-def products_valuation(db, tenant_id, branch_id=None,
-                       method=CostingMethod.MOVING_AVERAGE):
-    if method == CostingMethod.SNAPSHOT:
-        raise ValueError("SNAPSHOT qollanilmaydi.")
-    q = (db.query(Inventory.product_id,
-                  func.coalesce(func.sum(Inventory.quantity), 0).label("qty"))
-         .filter(Inventory.tenant_id == tenant_id))
-    if branch_id is not None:
-        q = q.filter(Inventory.branch_id == branch_id)
-    rows = q.group_by(Inventory.product_id).all()
-    out = []
-    for pid, qty in rows:
-        qty = float(qty or 0)
-        if qty <= 0:
+    for pid, val in valuation.items():
+        capital_locked = float(val["total_value"])
+        quantity = float(val["quantity"])
+        if capital_locked < cfg.min_capital:
             continue
-        p = db.query(Product).filter(Product.id == pid).first()
-        if not p:
+        total_locked += capital_locked
+        last_t = last_sale_map.get(pid)
+        last_sale_days = (now - last_t).days if last_t else None
+        v_recent = recent_qty.get(pid, 0.0) / cfg.velocity_window
+        v_prev = prev_qty.get(pid, 0.0) / cfg.velocity_window
+        stock_age = _stock_age_days(db, tenant_id, pid)
+
+        tier, action, reason = _classify_one(
+            quantity, capital_locked, last_sale_days,
+            v_recent, v_prev, stock_age, cfg)
+        tier_buckets[tier]["count"] += 1
+        tier_buckets[tier]["capital_locked"] += capital_locked
+        tier_buckets[tier]["quantity"] += quantity
+
+        if tier == "NORMAL" and not include_normal:
             continue
-        if method == CostingMethod.MOVING_AVERAGE:
-            unit = moving_average_cost(db, tenant_id, pid)
-        else:
-            unit = unit_cost_at(db, tenant_id, pid, method=method)
-        out.append({"product_id": pid, "sku": p.sku, "name": p.name,
-                    "quantity": qty, "unit_cost": round(unit, 2),
-                    "total_value": round(qty * unit, 2),
-                    "method": method.value})
-    out.sort(key=lambda x: x["total_value"], reverse=True)
-    return out
-'''
+        items.append({
+            "product_id": pid,
+            "sku": val.get("sku"),
+            "name": val.get("name"),
+            "quantity": round(quantity, 2),
+            "unit_cost": val.get("unit_cost"),
+            "capital_locked": round(capital_locked, 2),
+            "last_sale_days": int(last_sale_days) if last_sale_days is not None else None,
+            "velocity": round(v_recent, 3),
+            "velocity_prev": round(v_prev, 3),
+            "stock_age_days": stock_age,
+            "tier": tier,
+            "action": action,
+            "reason_tj": reason,
+            "expiry_status": "unavailable",
+        })
 
-FILES["backend/app/intelligence/profit.py"] = '''from datetime import datetime
-from sqlalchemy.orm import Session
-from sqlalchemy import func
-
-from app.models.sale import Sale, SaleItem
-from app.models.finance import Expense
-from app.models.company import Branch
-from app.models.product import Product
-from app.intelligence.costing import cogs_for_period, CostingMethod
-
-
-def real_profit(db, tenant_id, since=None, until=None,
-                branch_id=None, costing=CostingMethod.SNAPSHOT):
-    q_sales = db.query(
-        func.coalesce(func.sum(Sale.total), 0),
-        func.count(Sale.id),
-    ).filter(Sale.tenant_id == tenant_id)
-    if since:
-        q_sales = q_sales.filter(Sale.created_at >= since)
-    if until:
-        q_sales = q_sales.filter(Sale.created_at <= until)
-    if branch_id:
-        q_sales = q_sales.filter(Sale.branch_id == branch_id)
-    revenue, sales_count = q_sales.first()
-    revenue = float(revenue or 0)
-
-    effective_since = since or datetime(1970, 1, 1)
-    effective_until = until or datetime.utcnow()
-    cogs_result = cogs_for_period(
-        db, tenant_id, effective_since, effective_until,
-        method=costing, branch_id=branch_id)
-    cogs = float(cogs_result["cogs"])
-
-    q_exp = db.query(func.coalesce(func.sum(Expense.amount), 0))\\
-        .filter(Expense.tenant_id == tenant_id)
-    if since:
-        q_exp = q_exp.filter(Expense.created_at >= since)
-    if until:
-        q_exp = q_exp.filter(Expense.created_at <= until)
-    if branch_id:
-        q_exp = q_exp.filter(Expense.branch_id == branch_id)
-    expenses = float(q_exp.scalar() or 0)
-
-    gross = revenue - cogs
-    net = gross - expenses
+    items.sort(key=lambda x: x["capital_locked"], reverse=True)
     return {
+        "config": cfg.to_dict(),
+        "branch_id": branch_id,
         "costing_method": costing.value,
-        "revenue": round(revenue, 2),
-        "sales_count": int(sales_count or 0),
-        "cogs": round(cogs, 2),
-        "gross_profit": round(gross, 2),
-        "expenses": round(expenses, 2),
-        "net_profit": round(net, 2),
-        "gross_margin_pct": round((gross / revenue * 100) if revenue else 0, 2),
-        "net_margin_pct": round((net / revenue * 100) if revenue else 0, 2),
+        "generated_at": now.isoformat(),
+        "summary": {
+            "total_products": len(valuation),
+            "total_capital_locked": round(total_locked, 2),
+            "by_tier": {k: {"count": v["count"],
+                            "capital_locked": round(v["capital_locked"], 2),
+                            "quantity": round(v["quantity"], 2)}
+                        for k, v in tier_buckets.items()},
+        },
+        "items": items,
     }
 
 
-def profit_by_branch(db, tenant_id, since=None, until=None,
-                     costing=CostingMethod.SNAPSHOT):
+def summary(db, tenant_id, branch_id=None, cfg=None,
+            costing=CostingMethod.MOVING_AVERAGE):
+    return classify(db, tenant_id, branch_id, cfg,
+                    include_normal=False, costing=costing)["summary"]
+
+
+def by_tier(db, tenant_id, tier, branch_id=None, cfg=None,
+            costing=CostingMethod.MOVING_AVERAGE):
+    if tier not in ("DEAD", "SLOW", "AT-RISK", "NORMAL"):
+        raise ValueError(f"Notogri tier: {tier}")
+    result = classify(db, tenant_id, branch_id, cfg,
+                      include_normal=(tier == "NORMAL"), costing=costing)
+    return [i for i in result["items"] if i["tier"] == tier]
+
+
+def top_locked(db, tenant_id, limit=20, branch_id=None, cfg=None,
+               costing=CostingMethod.MOVING_AVERAGE):
+    result = classify(db, tenant_id, branch_id, cfg,
+                      include_normal=False, costing=costing)
+    return result["items"][:limit]
+
+
+def _empty_result(cfg):
+    return {
+        "config": cfg.to_dict(),
+        "branch_id": None,
+        "costing_method": None,
+        "generated_at": datetime.utcnow().isoformat(),
+        "summary": {
+            "total_products": 0,
+            "total_capital_locked": 0.0,
+            "by_tier": {
+                "DEAD": {"count": 0, "capital_locked": 0.0, "quantity": 0.0},
+                "SLOW": {"count": 0, "capital_locked": 0.0, "quantity": 0.0},
+                "AT-RISK": {"count": 0, "capital_locked": 0.0, "quantity": 0.0},
+                "NORMAL": {"count": 0, "capital_locked": 0.0, "quantity": 0.0},
+            },
+        },
+        "items": [],
+    }
+'''
+
+FILES["backend/app/intelligence/supplier_anomaly.py"] = '''from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta
+from statistics import median
+from sqlalchemy.orm import Session
+
+from app.models.product import Product
+from app.models.supplier import Supplier
+from app.models.purchase_history import PurchasePriceHistory
+
+
+@dataclass
+class AnomalyConfig:
+    window_days: int = 180
+    min_history: int = 3
+    pct_jump: float = 15.0
+    z_threshold: float = 3.5
+    supplier_gap_pct: float = 10.0
+    trend_min_points: int = 3
+    trend_pct: float = 10.0
+
+    def to_dict(self):
+        return asdict(self)
+
+
+def _chunks(seq, size):
+    seq = list(seq)
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
+def _load_history(db, tenant_id, since, product_ids=None):
+    if product_ids is None:
+        return (db.query(PurchasePriceHistory)
+                .filter(PurchasePriceHistory.tenant_id == tenant_id,
+                        PurchasePriceHistory.created_at >= since)
+                .order_by(PurchasePriceHistory.created_at.asc(),
+                          PurchasePriceHistory.id.asc()).all())
+    rows = []
+    for chunk in _chunks(product_ids, 500):
+        q = (db.query(PurchasePriceHistory)
+             .filter(PurchasePriceHistory.tenant_id == tenant_id,
+                     PurchasePriceHistory.created_at >= since,
+                     PurchasePriceHistory.product_id.in_(chunk))
+             .order_by(PurchasePriceHistory.created_at.asc(),
+                       PurchasePriceHistory.id.asc()))
+        rows.extend(q.all())
+    return rows
+
+
+def _robust_z(values):
+    if len(values) < 3:
+        return [0.0] * len(values)
+    med = median(values)
+    abs_dev = [abs(v - med) for v in values]
+    mad = median(abs_dev)
+    if mad == 0:
+        return [0.0] * len(values)
+    scale = 1.4826 * mad
+    return [(v - med) / scale for v in values]
+
+
+def _pct_change(prev, curr):
+    if prev <= 0:
+        return 0.0
+    return (curr - prev) / prev * 100.0
+
+
+def _detect_jumps(entries, cfg):
     out = []
-    for b in db.query(Branch).filter(Branch.tenant_id == tenant_id).all():
-        p = real_profit(db, tenant_id, since, until,
-                        branch_id=b.id, costing=costing)
-        out.append({"branch_id": b.id, "branch_name": b.name, **p})
-    out.sort(key=lambda x: x["net_profit"], reverse=True)
+    for i in range(1, len(entries)):
+        prev, curr = entries[i - 1], entries[i]
+        pct = _pct_change(float(prev.unit_price or 0),
+                          float(curr.unit_price or 0))
+        if pct >= cfg.pct_jump:
+            qty = float(curr.quantity or 0)
+            impact = (float(curr.unit_price or 0) - float(prev.unit_price or 0)) * qty
+            out.append({
+                "kind": "price_jump",
+                "at": curr.created_at.isoformat(),
+                "from_price": float(prev.unit_price or 0),
+                "to_price": float(curr.unit_price or 0),
+                "pct_change": round(pct, 2),
+                "quantity": qty,
+                "impact": round(max(0.0, impact), 2),
+                "supplier_id": curr.supplier_id,
+                "purchase_id": curr.purchase_id,
+                "message_tj": f"Narx {prev.unit_price} -> {curr.unit_price} (+{pct:.1f}%)",
+            })
     return out
 
 
-def profit_by_product(db, tenant_id, since=None, until=None,
-                      branch_id=None, limit=50):
-    q = (db.query(
-            SaleItem.product_id,
-            func.sum(SaleItem.quantity).label("qty"),
-            func.sum(SaleItem.price * SaleItem.quantity).label("revenue"),
-            func.sum(SaleItem.cost * SaleItem.quantity).label("cogs"))
-         .join(Sale, Sale.id == SaleItem.sale_id)
-         .filter(SaleItem.tenant_id == tenant_id))
-    if since:
-        q = q.filter(Sale.created_at >= since)
-    if until:
-        q = q.filter(Sale.created_at <= until)
-    if branch_id:
-        q = q.filter(Sale.branch_id == branch_id)
-    rows = q.group_by(SaleItem.product_id).all()
-    products = {p.id: p for p in db.query(Product).filter(
-        Product.tenant_id == tenant_id).all()}
-    result = []
-    for pid, qty, rev, cogs in rows:
-        rev = float(rev or 0)
-        cogs = float(cogs or 0)
-        profit = rev - cogs
-        p = products.get(pid)
-        result.append({
-            "product_id": pid,
-            "name": p.name if p else "?",
-            "sku": p.sku if p else None,
-            "quantity": float(qty or 0),
-            "revenue": round(rev, 2),
-            "cogs": round(cogs, 2),
-            "profit": round(profit, 2),
-            "margin_pct": round((profit / rev * 100) if rev else 0, 2),
-        })
-    result.sort(key=lambda x: x["profit"], reverse=True)
-    return result[:limit]
-'''
-
-FILES["backend/app/intelligence/leakage.py"] = '''from datetime import datetime, timedelta
-from sqlalchemy.orm import Session
-from sqlalchemy import func
-
-from app.models.sale import Sale, SaleItem
-from app.models.product import Product
-from app.models.inventory_count import InventoryCount
+def _detect_outliers(entries, cfg):
+    if len(entries) < cfg.min_history:
+        return []
+    prices = [float(e.unit_price or 0) for e in entries]
+    zs = _robust_z(prices)
+    med = median(prices)
+    out = []
+    for e, z in zip(entries, zs):
+        if abs(z) >= cfg.z_threshold and z > 0:
+            qty = float(e.quantity or 0)
+            impact = (float(e.unit_price or 0) - med) * qty
+            out.append({
+                "kind": "price_outlier",
+                "at": e.created_at.isoformat(),
+                "price": float(e.unit_price or 0),
+                "median_price": round(med, 2),
+                "z_score": round(z, 2),
+                "quantity": qty,
+                "impact": round(max(0.0, impact), 2),
+                "supplier_id": e.supplier_id,
+                "purchase_id": e.purchase_id,
+                "message_tj": f"Narx {e.unit_price} medianadan {z:.1f}s yuqori",
+            })
+    return out
 
 
-def _excess_discount(db, tenant_id):
-    row = db.query(
-        func.coalesce(func.sum(Sale.total), 0),
-        func.coalesce(func.sum(Sale.discount), 0),
-    ).filter(Sale.tenant_id == tenant_id).first()
-    revenue, discount = float(row[0] or 0), float(row[1] or 0)
-    gross = revenue + discount
-    if gross <= 0:
+def _detect_trend(entries, cfg):
+    if len(entries) < cfg.trend_min_points:
         return None
-    pct = discount / gross * 100
-    THRESHOLD = 8.0
-    if pct <= THRESHOLD:
+    first = float(entries[0].unit_price or 0)
+    last = float(entries[-1].unit_price or 0)
+    pct = _pct_change(first, last)
+    if pct < cfg.trend_pct:
         return None
-    excess = discount - gross * (THRESHOLD / 100)
-    return {"kind": "excess_discount", "amount": round(excess, 2),
-            "message_tj": f"Skidka ulushi {pct:.1f}% - meyordan yuqori. "
-                          f"Ortiqcha: {excess:,.0f} TJS."}
+    last_qty = float(entries[-1].quantity or 0)
+    impact = (last - first) * last_qty
+    return {
+        "kind": "upward_trend",
+        "points": len(entries),
+        "first_price": first,
+        "last_price": last,
+        "pct_change": round(pct, 2),
+        "quantity": last_qty,
+        "impact": round(max(0.0, impact), 2),
+        "supplier_id": entries[-1].supplier_id,
+        "message_tj": f"{len(entries)} ta xaridda narx {first} -> {last} (+{pct:.1f}%)",
+    }
 
 
-def _below_cost(db, tenant_id):
-    rows = (db.query(SaleItem, Product)
-            .join(Product, Product.id == SaleItem.product_id)
-            .filter(SaleItem.tenant_id == tenant_id,
-                    SaleItem.price < Product.cost_price).all())
-    loss = 0.0
-    count = 0
-    for si, p in rows:
-        diff = (p.cost_price or 0) - (si.price or 0)
-        if diff > 0:
-            loss += diff * (si.quantity or 0)
-            count += 1
-    if count == 0:
-        return None
-    return {"kind": "below_cost_sales", "amount": round(loss, 2),
-            "message_tj": f"{count} ta sotuv tan narxdan past. "
-                          f"Real zarar: {loss:,.0f} TJS."}
-
-
-def _inventory_variance(db, tenant_id, days=30):
-    since = datetime.utcnow() - timedelta(days=days)
-    rows = db.query(InventoryCount).filter(
-        InventoryCount.tenant_id == tenant_id,
-        InventoryCount.created_at >= since,
-        InventoryCount.variance_value > 0,
-    ).all()
-    if not rows:
-        return None
-    loss = sum(r.variance_value for r in rows)
-    return {"kind": "inventory_variance", "amount": round(loss, 2),
-            "message_tj": f"{len(rows)} ta inventarizatsiyada "
-                          f"{loss:,.0f} TJS zarar."}
-
-
-def detect_leakage(db, tenant_id):
-    findings = []
-    for fn in (_excess_discount, _below_cost, _inventory_variance):
-        r = fn(db, tenant_id)
-        if r:
-            findings.append(r)
-    total = sum(f["amount"] for f in findings)
-    return {"total_leak": round(total, 2), "findings": findings}
-'''
-
-FILES["backend/app/intelligence/dead_stock.py"] = '''from datetime import datetime, timedelta
-from sqlalchemy.orm import Session
-from sqlalchemy import func
-
-from app.models.product import Product, Inventory
-from app.models.sale import SaleItem, Sale
-
-
-def dead_stock(db, tenant_id, days=60):
-    since = datetime.utcnow() - timedelta(days=days)
-    sold_rows = (db.query(SaleItem.product_id)
-                 .join(Sale, Sale.id == SaleItem.sale_id)
-                 .filter(SaleItem.tenant_id == tenant_id,
-                         Sale.created_at >= since)
-                 .distinct().all())
-    sold_ids = {r[0] for r in sold_rows}
-    items = []
-    total_locked = 0.0
-    rows = (db.query(Product, func.coalesce(func.sum(Inventory.quantity), 0))
-            .outerjoin(Inventory, Inventory.product_id == Product.id)
-            .filter(Product.tenant_id == tenant_id)
-            .group_by(Product.id).all())
-    for p, qty in rows:
-        if qty <= 0 or p.id in sold_ids:
+def _detect_supplier_gaps(entries, cfg):
+    by_supplier = {}
+    for e in entries:
+        if e.supplier_id is None:
             continue
-        locked = qty * (p.cost_price or 0)
-        total_locked += locked
-        items.append({"product_id": p.id, "sku": p.sku, "name": p.name,
-                      "quantity": qty, "locked_capital": round(locked, 2),
-                      "recommendation_tj": f"{days} kundan beri sotilmagan."})
-    items.sort(key=lambda x: x["locked_capital"], reverse=True)
-    return {"capital_locked": round(total_locked, 2),
-            "items": items[:50], "days": days}
+        by_supplier.setdefault(e.supplier_id, []).append(e)
+    if len(by_supplier) < 2:
+        return []
+    medians = {sid: median([float(e.unit_price or 0) for e in rows])
+               for sid, rows in by_supplier.items()}
+    overall = median(list(medians.values()))
+    if overall <= 0:
+        return []
+    out = []
+    for sid, rows in by_supplier.items():
+        med = medians[sid]
+        gap = _pct_change(overall, med)
+        if gap < cfg.supplier_gap_pct:
+            continue
+        total_qty = sum(float(e.quantity or 0) for e in rows)
+        impact = (med - overall) * total_qty
+        out.append({
+            "kind": "supplier_gap",
+            "supplier_id": sid,
+            "median_price": round(med, 2),
+            "market_median": round(overall, 2),
+            "pct_vs_market": round(gap, 2),
+            "quantity": round(total_qty, 2),
+            "samples": len(rows),
+            "impact": round(max(0.0, impact), 2),
+            "message_tj": f"Boshqa supplierlarga nisbatan {gap:.1f}% qimmat",
+        })
+    out.sort(key=lambda x: x["impact"], reverse=True)
+    return out
+
+
+def _group_by_product(rows):
+    out = {}
+    for r in rows:
+        out.setdefault(r.product_id, []).append(r)
+    return out
+
+
+def analyze(db, tenant_id, cfg=None, product_id=None):
+    cfg = cfg or AnomalyConfig()
+    now = datetime.utcnow()
+    since = now - timedelta(days=cfg.window_days)
+    pid_filter = [product_id] if product_id else None
+    rows = _load_history(db, tenant_id, since, pid_filter)
+    if not rows:
+        return _empty(cfg, now, product_id)
+    grouped = _group_by_product(rows)
+    products = {p.id: p for p in db.query(Product).filter(
+        Product.tenant_id == tenant_id,
+        Product.id.in_(list(grouped.keys()))).all()}
+    suppliers = {s.id: s for s in db.query(Supplier).filter(
+        Supplier.tenant_id == tenant_id).all()}
+    supplier_agg = {}
+
+    def _touch_supplier(sid):
+        if sid not in supplier_agg:
+            supplier_agg[sid] = {
+                "supplier_id": sid,
+                "supplier_name": suppliers[sid].name if sid in suppliers else "?",
+                "anomaly_count": 0,
+                "products": set(),
+                "estimated_impact": 0.0,
+            }
+        return supplier_agg[sid]
+
+    product_findings = []
+    total_impact = 0.0
+    for pid, entries in grouped.items():
+        if len(entries) < cfg.min_history:
+            continue
+        findings = []
+        findings += _detect_jumps(entries, cfg)
+        findings += _detect_outliers(entries, cfg)
+        trend = _detect_trend(entries, cfg)
+        if trend:
+            findings.append(trend)
+        findings += _detect_supplier_gaps(entries, cfg)
+        if not findings:
+            continue
+        total_purchase_value = round(sum(float(e.total or 0) for e in entries), 2)
+        estimated_impact = round(sum(f.get("impact", 0.0) for f in findings), 2)
+        total_impact += estimated_impact
+        p = products.get(pid)
+        product_findings.append({
+            "product_id": pid,
+            "sku": p.sku if p else None,
+            "name": p.name if p else "?",
+            "history_points": len(entries),
+            "total_purchase_value": total_purchase_value,
+            "estimated_impact": estimated_impact,
+            "findings": findings,
+        })
+        for f in findings:
+            sid = f.get("supplier_id")
+            if sid is None:
+                continue
+            b = _touch_supplier(sid)
+            b["anomaly_count"] += 1
+            b["products"].add(pid)
+            b["estimated_impact"] += float(f.get("impact", 0.0) or 0.0)
+
+    product_findings.sort(key=lambda x: x["estimated_impact"], reverse=True)
+    suppliers_out = [{"supplier_id": b["supplier_id"],
+                      "supplier_name": b["supplier_name"],
+                      "anomaly_count": b["anomaly_count"],
+                      "products_count": len(b["products"]),
+                      "estimated_impact": round(b["estimated_impact"], 2)}
+                     for b in supplier_agg.values()]
+    suppliers_out.sort(key=lambda x: x["estimated_impact"], reverse=True)
+    return {
+        "config": cfg.to_dict(),
+        "generated_at": now.isoformat(),
+        "window_days": cfg.window_days,
+        "product_id": product_id,
+        "summary": {
+            "products_analyzed": len(grouped),
+            "products_with_anomalies": len(product_findings),
+            "total_estimated_impact": round(total_impact, 2),
+            "suppliers_flagged": len(suppliers_out),
+        },
+        "suppliers": suppliers_out,
+        "products": product_findings,
+    }
+
+
+def by_supplier(db, tenant_id, supplier_id, cfg=None):
+    full = analyze(db, tenant_id, cfg)
+    out = []
+    for p in full["products"]:
+        hits = [f for f in p["findings"]
+                if f.get("supplier_id") == supplier_id]
+        if hits:
+            out.append({**{k: v for k, v in p.items() if k != "findings"},
+                        "findings": hits,
+                        "estimated_impact": round(
+                            sum(f.get("impact", 0.0) for f in hits), 2)})
+    out.sort(key=lambda x: x["estimated_impact"], reverse=True)
+    return out
+
+
+def _empty(cfg, now, product_id):
+    return {
+        "config": cfg.to_dict(),
+        "generated_at": now.isoformat(),
+        "window_days": cfg.window_days,
+        "product_id": product_id,
+        "summary": {"products_analyzed": 0, "products_with_anomalies": 0,
+                    "total_estimated_impact": 0.0, "suppliers_flagged": 0},
+        "suppliers": [],
+        "products": [],
+    }
 '''
 
 
@@ -511,9 +565,9 @@ def main():
             f.write(content)
         count += 1
         print(f"OK {path}")
-    print(f"\nRound 2b: {count} ta fayl")
+    print(f"\nRound 2c: {count} ta fayl")
     subprocess.run(["git", "add", "-A"], check=False)
-    subprocess.run(["git", "commit", "-m", "Round 2b: Intelligence base"], check=False)
+    subprocess.run(["git", "commit", "-m", "Round 2c: dead_stock_tiers + supplier_anomaly"], check=False)
     subprocess.run(["git", "push", "origin", "main"], check=False)
     print("GitHub'ga yuborildi")
 
