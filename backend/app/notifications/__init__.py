@@ -1,0 +1,1 @@
+from app.notifications import models  # noqa\n
